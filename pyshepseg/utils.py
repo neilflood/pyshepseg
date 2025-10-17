@@ -291,6 +291,13 @@ def reportWorkerException(exceptionRecord):
 def formatTimingRpt(summaryDict):
     """
     Format a report on timings, given the output of Timers.makeSummaryDict()
+    Example usage::
+
+        tiledSegResult = doTiledShepherdSegmentation(...)
+        timings = tiledSegResult.timings
+        summaryDict = timings.makeSummaryDict()
+        reportStr = formatTimingRpt(summaryDict)
+        print(reportStr)
 
     Return a single string of the formatted report.
     """
@@ -300,7 +307,7 @@ def formatTimingRpt(summaryDict):
     if isSeg:
         hdr = "Segmentation Timings (sec)"
         timerList = ['spectralclusters', 'startworkers', 'reading',
-            'segmentation', 'stitchtiles']
+            'segmentation', 'stitchwaitfortile', 'stitchtiles']
     elif isStats:
         hdr = "Per-segment Stats Timings (sec)"
         timerList = ['reading', 'accumulation', 'statscompletion', 'writing']

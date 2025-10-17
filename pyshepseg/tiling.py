@@ -136,8 +136,8 @@ class TiledSegmentationResult(object):
         numbering. A warning message will also have been printed.
       timings : pyshepseg.timinghooks.Timers
         Timings for various key parts of the segmentation process
-      outDs: gdal.Dataset
-        Open GDAL dataset object to the output file. May not be set -
+      outDs : gdal.Dataset or None
+        Open GDAL dataset object to the output file. May be None,
         see the returnGDALDS parameter to doTiledShepherdSegmentation.
 
     """
@@ -591,41 +591,63 @@ def selectConcurrencyClass(concurrencyType, baseClass):
 
 class SegmentationConcurrencyConfig:
     """
-    Configuration for concurrency. This class can be used independantly to
-    configure concurrency in either segmentation or per-segment statistics.
+    Configuration for concurrency in segmentation of multiple tiles.
+
+    The segmentation of each tile can be performed concurrently by individual
+    workers. However, the stitching together of the resulting tiles is
+    inherently sequential, and with sufficient workers, this easily becomes
+    the dominant operation. Adding more workers after this simply increases
+    the memory usage for tiles waiting to be stitched (up to segResultCacheSize),
+    without any further speedup.
+
+    It is recommended that the user begin with a small number of workers, and
+    inspect the timings (see :func:`pyshepseg.utils.formatTimingRpt`) and
+    increase the number of workers so as to reduce ``stitchwaitfortile`` time.
+    When this no longer decreases, there is no further benefit to adding more
+    workers.
+
+    Parameters
+    ----------
+      concurrencyType : One of {CONC_NONE, CONC_THREADS, CONC_FARGATE, CONC_SUBPROC}
+        The mechanism used for concurrency
+      numWorkers : int
+        Number of segmentation workers
+      maxConcurrentReads : int
+        Maximum number of concurrent reads. Each segmentation worker
+        does its own reading of input data. Since the number of workers
+        can be quite large, this could load the read device too heavily.
+        Given that the read step is a very small component of each
+        worker's activity, we can limit the number of concurrent reads
+        to this value, without degrading throughput.
+      tileCompletionTimeout : int
+        Timeout (seconds) to wait for completion of each segmentation tile
+      segResultCacheSize : int
+        Maximum number of completed tile segmentations in cache
+      segResultCacheAddTimeout : int
+        Timeout (seconds) to wait to add a completed segmentation into
+        the result cache. If this timeout is reached, it may indicate that there
+        are too many workers.
+      barrierTimeout : int
+        Timeout (seconds) to wait for all workers to start. Used with
+        CONC_FARGATE (and CONC_SUBPROC).
+      fargateCfg : None or instance of FargateConfig
+        Configuration for AWS Fargate (when using CONC_FARGATE)
+
     """
     def __init__(self, concurrencyType=CONC_NONE, numWorkers=0,
             maxConcurrentReads=20, tileCompletionTimeout=60,
+            segResultCacheSize=30, segResultCacheAddTimeout=300,
             barrierTimeout=300, fargateCfg=None):
         """
         Configuration for managing segmentation concurrency.
-
-        Parameters
-        ----------
-          concurrencyType : One of {CONC_NONE, CONC_THREADS, CONC_FARGATE, CONC_SUBPROC}
-            The mechanism used for concurrency
-          numWorkers : int
-            Number of segmentation workers
-          maxConcurrentReads : int
-            Maximum number of concurrent reads. Each segmentation worker
-            does its own reading of input data. Since the number of workers
-            can be quite large, this could load the read device too heavily.
-            Given that the read step is a very small component of each
-            worker's activity, we can limit the number of concurrent reads
-            to this value, without degrading throughput.
-          tileCompletionTimeout : int
-            Timeout (seconds) to wait for completion of each segmentation tile
-          barrierTimeout : int
-            Timeout (seconds) to wait for all workers to start. Used with
-            CONC_FARGATE (and CONC_SUBPROC).
-          fargateCfg : None or instance of FargateConfig
-            Configuration for AWS Fargate (when using CONC_FARGATE)
 
         """
         self.concurrencyType = concurrencyType
         self.numWorkers = numWorkers
         self.maxConcurrentReads = maxConcurrentReads
         self.tileCompletionTimeout = tileCompletionTimeout
+        self.segResultCacheSize = segResultCacheSize
+        self.segResultCacheAddTimeout = segResultCacheAddTimeout
         self.barrierTimeout = barrierTimeout
         self.fargateCfg = fargateCfg
         if concurrencyType == CONC_FARGATE and fargateCfg is None:
@@ -634,11 +656,61 @@ class SegmentationConcurrencyConfig:
         if concurrencyType != CONC_FARGATE and fargateCfg is not None:
             msg = "fargateCfg is only used with CONC_FARGATE"
             raise PyShepSegTilingError(msg)
+        if self.segResultCacheSize < (2 * self.numWorkers):
+            msg = ("segResultCacheSize < 2*numWorkers. Increase " +
+                   "segResultCacheSize to avoid risk of deadlock")
+            raise PyShepSegTilingError(msg)
 
 
 class FargateConfig:
     """
-    Configuration for AWS Fargate
+    Configuration for AWS Fargate (i.e. for use with CONC_FARGATE).
+
+    Parameters
+    ----------
+      containerImage : str
+        URI of the container image to use for segmentation workers. This
+        container must have pyshepseg installed. It can be the same
+        container as used for the main script, as the entry point is
+        over-written.
+      taskRoleArn : str
+        ARN for an AWS role. This allows your code to use AWS services.
+        This role should include policies such as AmazonS3FullAccess,
+        covering any AWS services the segmentation workers will need.
+      executionRoleArn : str
+        ARN for an AWS role. This allows ECS to use AWS services on
+        your behalf. A good start is a role including
+        AmazonECSTaskExecutionRolePolicy
+      subnet : str
+        Subnet ID string associated with the VPC in which workers will
+        run.
+      securityGroups : list of str
+        Fargate. List of security group IDs associated with the VPC.
+      cpu : str
+        Number of CPU units requested for each segmentation worker,
+        expressed in AWS's own units. For example, '0.5 vCPU', or
+        '1024' (which corresponds to the same thing). Both must be strings.
+        This helps Fargate to select a suitable VM instance type.
+      memory : str
+        Amount of memory requested for each segmentation worker,
+        expressed in MiB, or with a units suffix. For example, '1024'
+        or its equivalent '1GB'. This helps Fargate to select a suitable
+        VM instance type.
+      cpuArchitecture : str
+        If given, selects the CPU architecture of the hosts to run
+        worker on. Can be 'ARM64', defaults to 'X86_64'.
+      cloudwatchLogGroup : str or None
+        If not None, the name of a CloudWatch log group. This group should
+        already exist, in the region that the job is running. Logs from
+        workers will be sent to this log group. If None, no CloudWatch
+        logging is done. Intended for tracking problems, rather than
+        operational use.
+      tags : dict or None
+        Optional. If specified this needs to be a dictionary of key/value
+        pairs which will be turned into AWS tags. These will be added to
+        the ECS cluster, task definition and tasks. The keys and values
+        must all be strings. Requires ``ecs:TagResource`` permission.
+
     """
     def __init__(self, containerImage=None, taskRoleArn=None,
             executionRoleArn=None, subnet=None,
@@ -647,51 +719,6 @@ class FargateConfig:
             tags=None):
         """
         AWS Fargate configuration information. For use only with CONC_FARGATE.
-
-        Parameters
-        ----------
-          containerImage : str
-            URI of the container image to use for segmentation workers. This
-            container must have pyshepseg installed. It can be the same
-            container as used for the main script, as the entry point is
-            over-written.
-          taskRoleArn : str
-            ARN for an AWS role. This allows your code to use AWS services.
-            This role should include policies such as AmazonS3FullAccess,
-            covering any AWS services the segmentation workers will need.
-          executionRoleArn : str
-            ARN for an AWS role. This allows ECS to use AWS services on
-            your behalf. A good start is a role including
-            AmazonECSTaskExecutionRolePolicy
-          subnet : str
-            Subnet ID string associated with the VPC in which workers will
-            run.
-          securityGroups : list of str
-            Fargate. List of security group IDs associated with the VPC.
-          cpu : str
-            Number of CPU units requested for each segmentation worker,
-            expressed in AWS's own units. For example, '0.5 vCPU', or
-            '1024' (which corresponds to the same thing). Both must be strings.
-            This helps Fargate to select a suitable VM instance type.
-          memory : str
-            Amount of memory requested for each segmentation worker,
-            expressed in MiB, or with a units suffix. For example, '1024'
-            or its equivalent '1GB'. This helps Fargate to select a suitable
-            VM instance type.
-          cpuArchitecture : str
-            If given, selects the CPU architecture of the hosts to run
-            worker on. Can be 'ARM64', defaults to 'X86_64'.
-          cloudwatchLogGroup : str or None
-            If not None, the name of a CloudWatch log group. This group should
-            already exist, in the region that the job is running. Logs from
-            workers will be sent to this log group. If None, no CloudWatch
-            logging is done. Intended for tracking problems, rather than
-            operational use.
-          tags: dict or None
-            Optional. If specified this needs to be a dictionary of key/value
-            pairs which will be turned into AWS tags. These will be added to
-            the ECS cluster, task definition and tasks. The keys and values
-            must all be strings. Requires ``ecs:TagResource`` permission.
         """
         self.containerImage = containerImage
         self.taskRoleArn = taskRoleArn
@@ -892,7 +919,7 @@ class SegmentationConcurrencyMgr:
         Run segmentation for all tiles, and write output image. Runs a number
         of segmentation workers, each working independently on individual
         tiles. The tiles to process are sent via a Queue, and the computed
-        results are returned via a different Queue.
+        results are returned via the SegmentationResultCache.
 
         Stitching the tiles together is run in the main thread, beginning as
         soon as the first tile is completed.
@@ -902,7 +929,9 @@ class SegmentationConcurrencyMgr:
 
         self.inQue = queue.Queue()
         self.segResultCache = SegmentationResultCache(colRowList,
-            timeout=self.concurrencyCfg.tileCompletionTimeout)
+            timeout=self.concurrencyCfg.tileCompletionTimeout,
+            size=self.concurrencyCfg.segResultCacheSize,
+            addTimeout=self.concurrencyCfg.segResultCacheAddTimeout)
         self.forceExit = threading.Event()
         self.exceptionQue = queue.Queue()
         numWorkers = self.concurrencyCfg.numWorkers
@@ -930,8 +959,8 @@ class SegmentationConcurrencyMgr:
                 self.startWorkers()
                 maxMem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                 print('Max Mem Usage after tiles', maxMem)
-            with self.timings.interval('stitchtiles'):
-                self.stitchTiles()
+
+            self.stitchTiles()
         finally:
             self.shutdown()
                 
@@ -1016,7 +1045,8 @@ class SegmentationConcurrencyMgr:
             reportedRow = row
 
             (xpos, ypos, xsize, ysize) = self.tileInfo.getTile(col, row)
-            tileData = self.getTileSegmentation(col, row)
+            with self.timings.interval('stitchwaitfortile'):
+                tileData = self.getTileSegmentation(col, row)
 
             if tileData is not None:
                 top = marginSize
@@ -1046,26 +1076,27 @@ class SegmentationConcurrencyMgr:
                     right = xsize
                     rightName = None
 
-                if self.simpleTileRecode:
-                    nullmask = (tileData == shepseg.SEGNULLVAL)
-                    tileData += maxSegId
-                    tileData[nullmask] = shepseg.SEGNULLVAL
-                else:
-                    tileData = self.recodeTile(tileData, maxSegId, row, col,
-                                top, bottom, left, right)
+                with self.timings.interval('stitchtiles'):
+                    if self.simpleTileRecode:
+                        nullmask = (tileData == shepseg.SEGNULLVAL)
+                        tileData += maxSegId
+                        tileData[nullmask] = shepseg.SEGNULLVAL
+                    else:
+                        tileData = self.recodeTile(tileData, maxSegId, row, col,
+                                    top, bottom, left, right)
 
-                tileDataTrimmed = tileData[top:bottom, left:right]
-                outBand.WriteArray(tileDataTrimmed, xout, yout)
-                self.writeOverviews(outBand, tileDataTrimmed, xout, yout)
-                histAccum.doHistAccum(tileDataTrimmed)
+                    tileDataTrimmed = tileData[top:bottom, left:right]
+                    outBand.WriteArray(tileDataTrimmed, xout, yout)
+                    self.writeOverviews(outBand, tileDataTrimmed, xout, yout)
+                    histAccum.doHistAccum(tileDataTrimmed)
 
-                if rightName is not None:
-                    self.saveOverlap(rightName, tileData[:, -self.overlapSize:])
-                if bottomName is not None:
-                    self.saveOverlap(bottomName, tileData[-self.overlapSize:, :])
+                    if rightName is not None:
+                        self.saveOverlap(rightName, tileData[:, -self.overlapSize:])
+                    if bottomName is not None:
+                        self.saveOverlap(bottomName, tileData[-self.overlapSize:, :])
 
-                tileMaxSegId = tileDataTrimmed.max()
-                maxSegId = max(maxSegId, tileMaxSegId)
+                    tileMaxSegId = tileDataTrimmed.max()
+                    maxSegId = max(maxSegId, tileMaxSegId)
                 i += 1
             else:
                 self.checkWorkerExceptions()
@@ -1077,12 +1108,14 @@ class SegmentationConcurrencyMgr:
                        "errors in segmentation workers").format(timeout)
                 raise PyShepSegTilingError(msg)
 
-        self.writeHistogramToFile(outBand, histAccum)
-        self.hasEmptySegments = self.checkForEmptySegments(histAccum.hist,
-            self.overlapSize)
-        utils.estimateStatsFromHisto(outBand, histAccum.hist)
-        self.maxSegId = maxSegId
-        outDs.FlushCache()
+        with self.timings.interval('stitchtiles'):
+            self.writeHistogramToFile(outBand, histAccum)
+            self.hasEmptySegments = self.checkForEmptySegments(histAccum.hist,
+                self.overlapSize)
+            utils.estimateStatsFromHisto(outBand, histAccum.hist)
+            self.maxSegId = maxSegId
+            outDs.FlushCache()
+
         if self.returnGDALDS:
             self.outDs = outDs
         else:
@@ -1485,8 +1518,7 @@ class SegNoConcurrencyMgr(SegmentationConcurrencyMgr):
 
             tileNum += 1
 
-        with self.timings.interval('stitchtiles'):
-            self.stitchTiles()
+        self.stitchTiles()
 
         shutil.rmtree(self.tempDir)
 
@@ -1628,9 +1660,12 @@ class SegThreadsMgr(SegmentationConcurrencyMgr):
         """
         Shut down the thread pool
         """
-        self.forceExit.set()
-        futures.wait(self.workerList)
-        self.threadPool.shutdown()
+        if hasattr(self, 'forceExit'):
+            self.forceExit.set()
+        if hasattr(self, 'workerList'):
+            futures.wait(self.workerList)
+        if hasattr(self, 'threadPool'):
+            self.threadPool.shutdown()
 
     def setupNetworkComms(self):
         """
@@ -1759,12 +1794,15 @@ class SegFargateMgr(SegmentationConcurrencyMgr):
         """
         if hasattr(self, 'forceExit'):
             self.forceExit.set()
-        self.waitClusterTasksFinished()
-        self.checkTaskErrors()
-        self.ecsClient.delete_cluster(cluster=self.clusterName)
+        if hasattr(self, 'ecsClient'):
+            self.waitClusterTasksFinished()
+            self.checkTaskErrors()
+            self.ecsClient.delete_cluster(cluster=self.clusterName)
         if hasattr(self, 'dataChan'):
             self.dataChan.shutdown()
-        self.ecsClient.deregister_task_definition(taskDefinition=self.taskDefArn)
+        if hasattr(self, 'ecsClient'):
+            self.ecsClient.deregister_task_definition(
+                taskDefinition=self.taskDefArn)
 
     def waitClusterTasksFinished(self):
         """
@@ -2029,8 +2067,11 @@ class SegmentationResultCache:
     a tile, it adds it directly to this cache. The writing thread can then
     pop tiles out of this when required.
     """
-    def __init__(self, colRowList, timeout=None):
+    def __init__(self, colRowList, timeout=None, size=10, addTimeout=300):
         self.timeout = timeout
+        self.size = size
+        self.cacheCount = threading.BoundedSemaphore(self.size)
+        self.addTimeout = addTimeout
         self.lock = threading.Lock()
         self.cache = {}
         self.completionEvent = {}
@@ -2041,6 +2082,16 @@ class SegmentationResultCache:
         """
         Add a single segResult object to the cache, for the given (col, row)
         """
+        # First check we have room in the cache
+        cacheCountAcquired = self.cacheCount.acquire(timeout=self.addTimeout)
+        if not cacheCountAcquired:
+            msg = ("Timeout acquiring space in SegmentationResultCache. " +
+                   "Try increasing segResultCacheAddTimeout " +
+                   "(currently {}) ".format(self.addTimeout) +
+                   "or segResultCacheSize (currently {}), ".format(self.size) +
+                   "or reducing the number of workers")
+            raise PyShepSegTilingError(msg)
+
         with self.lock:
             key = (col, row)
             self.cache[key] = segResult
@@ -2056,6 +2107,8 @@ class SegmentationResultCache:
         if completed:
             segResult = self.cache.pop(key)
             self.completionEvent[key].clear()
+            # One less tile in the cache
+            self.cacheCount.release()
         else:
             segResult = None
         return segResult

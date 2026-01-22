@@ -14,6 +14,17 @@ import argparse
 import numpy
 
 from osgeo import gdal
+try:
+    from rios.applier import ConcurrencyStyle
+    HAVE_RIOS = True
+except ImportError:
+    ConcurrencyStyle = None
+    HAVE_RIOS = False
+
+try:
+    import ratzarr
+except ImportError:
+    ratzarr = None
 
 from pyshepseg import shepseg, tiling, tilingstats, utils, subset
 
@@ -94,14 +105,18 @@ def main():
     # Note that we use fourConnected=False, to avoid disconnecting the 
     # pointy ends of long thin slivers, which can arise due to how we
     # generated the original segments. 
-    segResults = tiling.doTiledShepherdSegmentation(imagefile, outsegfile, 
+    tiling.doTiledShepherdSegmentation(imagefile, outsegfile,
         numClusters=numClusters, fixedKMeansInit=True, fourConnected=False)
     
     # some columns that test the stats
-    (meanColNames, stdColNames) = makeRATcolumns(segResults, outsegfile, imagefile)
-    
+    print('Make stats columns')
+    (meanColNames, stdColNames) = makeRATcolumns(outsegfile, imagefile)
+    allStatsCols = meanColNames + stdColNames
+
     # some columns that test the spatial stats
+    print('Make spatial stats columns')
     (eastingCol, northingCol) = makeSpatialRATColumns(outsegfile, imagefile)
+    allSpatialCols = [eastingCol, northingCol]
 
     # check the segmentation via the non-spatial stats
     pcntMatch = checkSegmentation(imagefile, outsegfile, meanColNames,
@@ -116,7 +131,33 @@ def main():
     if not checkSpatialColumns(outsegfile, eastingCol, northingCol):
         print('Mean coordinates of segments differ')
         errorStatus = 1
-        
+
+    if HAVE_RIOS:
+        print('Make stats columns with RIOS')
+        tmpRatFile = 'tmp_statsRIOS.kea'
+        tmpdatafiles.append(tmpRatFile)
+        makeRATcolumns(outsegfile, imagefile, outFile=tmpRatFile,
+                       useRIOS=True)
+        errMsgList = checkRatColumns(outsegfile, tmpRatFile, False, allStatsCols)
+        if len(errMsgList) > 0:
+            for msg in errMsgList:
+                print(msg)
+            errorStatus = 1
+
+        print('Make spatial stats columns with RIOS')
+        tmpSpatialRatFile = 'tmp_spatialstatsRIOS.kea'
+        tmpdatafiles.append(tmpSpatialRatFile)
+        makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpSpatialRatFile,
+            useRIOS=True)
+        errMsgList = checkRatColumns(outsegfile, tmpSpatialRatFile, False,
+            allSpatialCols)
+        if len(errMsgList) > 0:
+            for msg in errMsgList:
+                print(msg)
+            errorStatus = 1
+    else:
+        print("Skipped RIOS tests")
+
     print("Checking subset functionality")
     if not checkSubset(outsegfile, subset_segfile):
         print('Unable to match new values from subset')
@@ -126,11 +167,48 @@ def main():
     utils.writeColorTableFromRatColumns(outsegfile, meanColNames[0], 
         meanColNames[1], meanColNames[2])
 
+    # Test Zarr stats output
+    if ratzarr is not None:
+        print("Test Zarr stats output (basic & spatial)")
+        tmpZarrFile = "tmp_stats.zarr"
+        makeRATcolumns(outsegfile, imagefile,
+                       outFile=tmpZarrFile, outFileIsZarr=True)
+        makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpZarrFile,
+                       outFileIsZarr=True)
+        allStatsCols = meanColNames + stdColNames + [eastingCol, northingCol]
+        errMsgList = checkRatColumns(outsegfile, tmpZarrFile, True, allStatsCols)
+        if len(errMsgList) > 0:
+            for msg in errMsgList:
+                print(msg)
+            errorStatus = 1
+    else:
+        print("Skipped Zarr tests")
+
+    if HAVE_RIOS and ratzarr is not None:
+        print("Test Zarr stats output using RIOS (basic & spatial)")
+        tmpZarrRIOSFile = "tmp_statsRIOS.zarr"
+        makeRATcolumns(outsegfile, imagefile,
+                       outFile=tmpZarrRIOSFile, outFileIsZarr=True)
+        makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpZarrRIOSFile,
+                       outFileIsZarr=True, useRIOS=True)
+        allStatsCols = meanColNames + stdColNames + [eastingCol, northingCol]
+        errMsgList = checkRatColumns(outsegfile, tmpZarrRIOSFile, True,
+                                     allStatsCols)
+        if len(errMsgList) > 0:
+            for msg in errMsgList:
+                print(msg)
+            errorStatus = 1
+    else:
+        print("Skipped RIOS+Zarr tests")
+
     if not cmdargs.keep:
         print("Removing generated data")
         for fn in tmpdatafiles:
             drvr = gdal.IdentifyDriver(fn)
             drvr.Delete(fn)
+        if ratzarr is not None:
+            ratzarr.RatZarr.delete(tmpZarrFile)
+            ratzarr.RatZarr.delete(tmpZarrRIOSFile)
 
     # Exit with an explicit status code, so that Github workflow
     # can recognise if something went wrong. 
@@ -276,7 +354,8 @@ def readSeg(segfile, xoff=0, yoff=0, win_xsize=None, win_ysize=None):
     return seg
 
 
-def makeRATcolumns(segResults, outsegfile, imagefile):
+def makeRATcolumns(outsegfile, imagefile, outFile=None, outFileIsZarr=False,
+        useRIOS=False):
     """
     Add some columns to the RAT, with useful per-segment statistics
     """
@@ -289,13 +368,22 @@ def makeRATcolumns(segResults, outsegfile, imagefile):
         meanColNames.append(meanCol)
         stdColNames.append(stdCol)
         statsSelection = [(meanCol, "mean"), (stdCol, "stddev")]
-        tilingstats.calcPerSegmentStatsTiled(imagefile, (i + 1), outsegfile, 
-            statsSelection)
+        if useRIOS:
+            concStyle = ConcurrencyStyle(numReadWorkers=1)
+            tilingstats.calcPerSegmentStatsRIOS(
+                imagefile, (i + 1), outsegfile, statsSelection,
+                concurrencyStyle=concStyle,
+                outFile=outFile, outFileIsZarr=outFileIsZarr)
+        else:
+            tilingstats.calcPerSegmentStatsTiled(
+                imagefile, (i + 1), outsegfile, statsSelection,
+                outFile=outFile, outFileIsZarr=outFileIsZarr)
     
     return (meanColNames, stdColNames)
 
 
-def makeSpatialRATColumns(segfile, imagefile):
+def makeSpatialRATColumns(segfile, imagefile, outFile=None,
+        outFileIsZarr=False, useRIOS=False):
     """
     Create some RAT columns for checking the spatial stats 
     functionality. 
@@ -314,8 +402,16 @@ def makeSpatialRATColumns(segfile, imagefile):
     colNamesAndTypes = [(eastingCol, gdal.GFT_Real), 
                 (northingCol, gdal.GFT_Real)]
     # call calcPerSegmentSpatialStatsTiled to do the stats
-    tilingstats.calcPerSegmentSpatialStatsTiled(imagefile, 1, segfile,
-           colNamesAndTypes, tilingstats.userFuncMeanCoord, transform)
+    if useRIOS:
+        concStyle = ConcurrencyStyle(numReadWorkers=1)
+        tilingstats.calcPerSegmentSpatialStatsRIOS(imagefile, 1, segfile,
+           colNamesAndTypes, tilingstats.userFuncMeanCoord, transform,
+           concurrencyStyle=concStyle,
+           outFile=outFile, outFileIsZarr=outFileIsZarr)
+    else:
+        tilingstats.calcPerSegmentSpatialStatsTiled(imagefile, 1, segfile,
+           colNamesAndTypes, tilingstats.userFuncMeanCoord, transform,
+           outFile=outFile, outFileIsZarr=outFileIsZarr)
     
     # return the names of the columns
     return (eastingCol, northingCol)
@@ -345,7 +441,7 @@ def checkSegmentation(imgfile, segfile, meanColNames, stdColNames):
         bandobj = ds.GetRasterBand(i + 1)
         img = bandobj.ReadAsArray()
 
-        segmeans = readColumn(segfile, meanColNames[i])
+        segmeans = readColumn(segfile, meanColNames[i], False)
 
         # An img of the segmean for this band, for each pixel. 
         segColour = segmeans[seg]
@@ -386,8 +482,8 @@ def checkSpatialColumns(segfile, eastingCol, northingCol):
     
     """
     # read in the data to check
-    eastingData = readColumn(segfile, eastingCol)
-    northingData = readColumn(segfile, northingCol)
+    eastingData = readColumn(segfile, eastingCol, False)
+    northingData = readColumn(segfile, northingCol, False)
 
     # read in the segfile
     seg = readSeg(segfile)
@@ -420,7 +516,7 @@ def checkSubset(outsegfile, subset_segfile):
     """
     subset.subsetImage(outsegfile, subset_segfile, 4000, 4000, 1000, 1000, 'KEA',
         origSegIdColName='orig_val')
-    lookupcol = readColumn(subset_segfile, 'orig_val')
+    lookupcol = readColumn(subset_segfile, 'orig_val', False)
     oldvals = readSeg(outsegfile, 4000, 4000, 1000, 1000)
     newvals = readSeg(subset_segfile)
     if newvals.min() != 1:
@@ -431,20 +527,65 @@ def checkSubset(outsegfile, subset_segfile):
     return (new2oldvals == oldvals).all()
     
 
-def readColumn(segfile, colName):
+def readColumn(ratfile, colName, fileIsRatZarr):
     """
-    Read the given column from the given segmentation image file.
+    Read the given column from the given RAT file. Copes with either
+    a GDAL-based RAT or a RatZarr file, determined by the fileIsRatZarr
+    parameter.
+
     Return an array of the column values. 
     """
-    ds = gdal.Open(segfile)
-    band = ds.GetRasterBand(1)
-    attrTbl = band.GetDefaultRAT()
-    numCols = attrTbl.GetColumnCount()
-    colNameList = [attrTbl.GetNameOfCol(i) for i in range(numCols)]
-    colNdx = colNameList.index(colName)
-    col = attrTbl.ReadAsArray(colNdx)
+    if fileIsRatZarr:
+        rz = ratzarr.RatZarr(ratfile)
+        col = rz.readBlock(colName, 0, rz.rowCount)
+    else:
+        ds = gdal.Open(ratfile)
+        band = ds.GetRasterBand(1)
+        attrTbl = band.GetDefaultRAT()
+        numCols = attrTbl.GetColumnCount()
+        colNameList = [attrTbl.GetNameOfCol(i) for i in range(numCols)]
+        colNdx = colNameList.index(colName)
+        col = attrTbl.ReadAsArray(colNdx)
     
     return col
+
+
+def checkRatColumns(segfile, ratfile, fileIsRatZarr, allStatsCols):
+    """
+    Check that the contents of the stats columns is the same in the segfile
+    and the given rat file. The segfile is assumed to be GDAL-based,
+    but the ratfile could be RatZarr.
+    """
+    errMsgList = []
+
+    for colName in allStatsCols:
+        refCol = readColumn(segfile, colName, False)
+        testCol = readColumn(ratfile, colName, fileIsRatZarr)
+        pcntDiff = vecPcntDiff(refCol, testCol)
+        if pcntDiff > 0.00000001:
+            msg = f"'{colName}': Differs from reference by {pcntDiff}%"
+            errMsgList.append(msg)
+    return errMsgList
+
+
+def vecPcntDiff(v1, v2):
+    """
+    Calculate a percentage difference between two vectors
+    """
+    def vecLen(v):
+        return numpy.sqrt((v**2).sum())
+
+    d = vecLen(v1 - v2)
+    l1 = vecLen(v1)
+    l2 = vecLen(v2)
+    meanLen = (l1 + l2) / 2
+    if meanLen > 0:
+        pcntDiff = 100 * d / meanLen
+    elif d == 0:
+        pcntDiff = 0
+    else:
+        raise ValueError(f"vecPcntDiff error: {d} {l1} {l2}")
+    return pcntDiff
 
 
 if __name__ == "__main__":

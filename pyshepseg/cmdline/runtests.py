@@ -10,6 +10,7 @@ coded to behave sensibly.
 import sys
 import os
 import argparse
+import shutil
 
 import numpy
 
@@ -107,6 +108,11 @@ def main():
     # generated the original segments. 
     tiling.doTiledShepherdSegmentation(imagefile, outsegfile,
         numClusters=numClusters, fixedKMeansInit=True, fourConnected=False)
+
+    # Save the segfile for a later test
+    segfilecopy = "tmp_seg_copy.kea"
+    shutil.copy(outsegfile, segfilecopy)
+    tmpdatafiles.append(segfilecopy)
     
     # some columns that test the stats
     print('Make stats columns')
@@ -130,6 +136,38 @@ def main():
     # check the spatial cols
     if not checkSpatialColumns(outsegfile, eastingCol, northingCol):
         print('Mean coordinates of segments differ')
+        errorStatus = 1
+
+    print('Make stats columns with readWorkers')
+    tmpRatFile = 'tmp_statsReadWorkers.kea'
+    tmpdatafiles.append(tmpRatFile)
+    makeRATcolumns(outsegfile, imagefile, outFile=tmpRatFile,
+                   numReadWorkers=1)
+    errMsgList = checkRatColumns(outsegfile, tmpRatFile, False, allStatsCols)
+    if len(errMsgList) > 0:
+        for msg in errMsgList:
+            print(msg)
+        errorStatus = 1
+
+    print('Make stats column in segfile, with readWorkers')
+    makeRATcolumns(segfilecopy, imagefile, numReadWorkers=1)
+    errMsgList = checkRatColumns(outsegfile, segfilecopy, False,
+        allStatsCols)
+    if len(errMsgList) > 0:
+        for msg in errMsgList:
+            print(msg)
+        errorStatus = 1
+
+    print('Make spatial stats columns with readWorkers')
+    tmpSpatialRatFile = 'tmp_spatialstatsReadWorkers.kea'
+    tmpdatafiles.append(tmpSpatialRatFile)
+    makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpSpatialRatFile,
+        numReadWorkers=1)
+    errMsgList = checkRatColumns(outsegfile, tmpSpatialRatFile, False,
+        allSpatialCols)
+    if len(errMsgList) > 0:
+        for msg in errMsgList:
+            print(msg)
         errorStatus = 1
 
     if HAVE_RIOS:
@@ -174,9 +212,23 @@ def main():
         makeRATcolumns(outsegfile, imagefile,
                        outFile=tmpZarrFile, outFileIsZarr=True)
         makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpZarrFile,
-                       outFileIsZarr=True)
+                              outFileIsZarr=True)
         allStatsCols = meanColNames + stdColNames + [eastingCol, northingCol]
         errMsgList = checkRatColumns(outsegfile, tmpZarrFile, True, allStatsCols)
+        if len(errMsgList) > 0:
+            for msg in errMsgList:
+                print(msg)
+            errorStatus = 1
+
+        print('Make Zarr stats columns (basic & spatial) with readWorkers')
+        tmpRatFile = 'tmp_statsReadWorkers.zarr'
+        tmpdatafiles.append(tmpRatFile)
+        makeRATcolumns(outsegfile, imagefile, outFile=tmpRatFile,
+                numReadWorkers=1, outFileIsZarr=True)
+        makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpRatFile,
+                numReadWorkers=1, outFileIsZarr=True)
+        errMsgList = checkRatColumns(outsegfile, tmpRatFile, True,
+            allSpatialCols)
         if len(errMsgList) > 0:
             for msg in errMsgList:
                 print(msg)
@@ -187,8 +239,8 @@ def main():
     if HAVE_RIOS and ratzarr is not None:
         print("Test Zarr stats output using RIOS (basic & spatial)")
         tmpZarrRIOSFile = "tmp_statsRIOS.zarr"
-        makeRATcolumns(outsegfile, imagefile,
-                       outFile=tmpZarrRIOSFile, outFileIsZarr=True)
+        makeRATcolumns(outsegfile, imagefile, outFile=tmpZarrRIOSFile,
+                       outFileIsZarr=True, useRIOS=True)
         makeSpatialRATColumns(outsegfile, imagefile, outFile=tmpZarrRIOSFile,
                        outFileIsZarr=True, useRIOS=True)
         allStatsCols = meanColNames + stdColNames + [eastingCol, northingCol]
@@ -355,7 +407,7 @@ def readSeg(segfile, xoff=0, yoff=0, win_xsize=None, win_ysize=None):
 
 
 def makeRATcolumns(outsegfile, imagefile, outFile=None, outFileIsZarr=False,
-        useRIOS=False):
+        useRIOS=False, numReadWorkers=0):
     """
     Add some columns to the RAT, with useful per-segment statistics
     """
@@ -375,15 +427,17 @@ def makeRATcolumns(outsegfile, imagefile, outFile=None, outFileIsZarr=False,
                 concurrencyStyle=concStyle,
                 outFile=outFile, outFileIsZarr=outFileIsZarr)
         else:
+            readCfg = tilingstats.StatsReadConfig(numWorkers=numReadWorkers)
             tilingstats.calcPerSegmentStatsTiled(
                 imagefile, (i + 1), outsegfile, statsSelection,
-                outFile=outFile, outFileIsZarr=outFileIsZarr)
+                outFile=outFile, outFileIsZarr=outFileIsZarr,
+                readCfg=readCfg)
     
     return (meanColNames, stdColNames)
 
 
 def makeSpatialRATColumns(segfile, imagefile, outFile=None,
-        outFileIsZarr=False, useRIOS=False):
+        outFileIsZarr=False, useRIOS=False, numReadWorkers=0):
     """
     Create some RAT columns for checking the spatial stats 
     functionality. 
@@ -409,9 +463,10 @@ def makeSpatialRATColumns(segfile, imagefile, outFile=None,
            concurrencyStyle=concStyle,
            outFile=outFile, outFileIsZarr=outFileIsZarr)
     else:
+        readCfg = tilingstats.StatsReadConfig(numWorkers=numReadWorkers)
         tilingstats.calcPerSegmentSpatialStatsTiled(imagefile, 1, segfile,
            colNamesAndTypes, tilingstats.userFuncMeanCoord, transform,
-           outFile=outFile, outFileIsZarr=outFileIsZarr)
+           outFile=outFile, outFileIsZarr=outFileIsZarr, readCfg=readCfg)
     
     # return the names of the columns
     return (eastingCol, northingCol)
